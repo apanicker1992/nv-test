@@ -1,0 +1,57 @@
+#!/usr/bin/python2
+
+import requests
+import json
+import datetime
+import sys
+
+# Disable SSL warnings
+requests.packages.urllib3.disable_warnings(requests.packages.urllib3.exceptions.InsecureRequestWarning)
+
+# Configuration
+neuvector_ip = "<neuvector_ip>"
+port = "<port>"
+username = "admin"
+password = "admin_password"
+
+# Get current date and time
+date = datetime.datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
+filename = "backup_config_{}.conf.gz".format(date)
+
+# Get the API token
+def get_api_token():
+    url = "https://{}:{}/v1/auth".format(neuvector_ip, port)
+    payload = {
+        "username": username,
+        "password": password
+    }
+    try:
+        response = requests.post(url, json=payload, verify=False)
+        response.raise_for_status()
+        return response.json().get('token')
+    except requests.exceptions.RequestException as e:
+        print("Error: Unable to obtain token")
+        print(e)
+        sys.exit(1)
+
+# Export configuration
+def export_configuration(token):
+    url = "https://{}:{}/v1/file/config?raw=true".format(neuvector_ip, port)
+    headers = {
+        'Content-Type': 'application/json',
+        'Authorization': 'Bearer {}'.format(token)
+    }
+    try:
+        response = requests.get(url, headers=headers, verify=False)
+        response.raise_for_status()
+        with open(filename, 'wb') as f:
+            f.write(response.content)
+        print("Configuration successfully exported to {}".format(filename))
+    except requests.exceptions.RequestException as e:
+        print("Error: Failed to export configuration")
+        print(e)
+        sys.exit(1)
+
+if __name__ == "__main__":
+    token = get_api_token()
+    export_configuration(token)
