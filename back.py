@@ -1,4 +1,19 @@
 #!/usr/bin/python2
+def manage_backups(folder):
+    backups = sorted(
+        (os.path.join(folder, f) for f in os.listdir(folder) if f.endswith('.conf.gz')),
+        key=os.path.getctime
+    )
+
+    # Delete the oldest backup if there are more than 3
+    while len(backups) > 3:
+        oldest_backup = backups.pop(0)
+        try:
+            os.remove(oldest_backup)
+            print("Deleted oldest backup: {}".format(oldest_backup))
+        except OSError as e:
+            print("Error: Failed to delete {} ({})".format(oldest_backup, e))
+
 
 import requests
 import json
