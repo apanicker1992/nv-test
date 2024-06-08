@@ -1,3 +1,30 @@
+
+# Use an official Python runtime as a parent image
+FROM python:2.7-slim
+
+# Set the working directory in the container
+WORKDIR /usr/src/app
+
+# Copy the current directory contents into the container at /usr/src/app
+COPY . .
+
+# Install any needed packages specified in requirements.txt
+RUN pip install --no-cache-dir requests
+
+# Make port 80 available to the world outside this container
+EXPOSE 80
+
+# Run backup_neuvector.py when the container launches
+CMD ["python", "./backup_neuvector.py"]
+
+
+docker build -t neuvector-backup .
+
+
+
+docker run -v /path/to/backup/folder:/usr/src/app/backups neuvector-backup
+
+
 #!/usr/bin/python2
 def manage_backups(folder):
     backups = sorted(
