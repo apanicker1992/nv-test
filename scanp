@@ -1,0 +1,53 @@
+#!/usr/bin/python
+
+import argparse
+import json
+import requests
+import sys
+
+import client
+
+def list_containers(c):
+    url = "v1/hosts"
+    response = c.get(url)
+    if response.status_code == requests.codes.ok:
+        hosts = response.json().get('hosts', [])
+        for host in hosts:
+            print("ID: {}".format(host['id']))
+        return True
+    else:
+        print("Error: Failed to retrieve hosts")
+        return False
+
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser(description='List all container IDs')
+    parser.add_argument('-d', '--debug', action="store_true", help='Enable debug')
+    parser.add_argument('-s', '--server', default="127.0.0.1", help='Controller IP address.')
+    parser.add_argument('-p', '--port', type=int, default=443, help='Controller port.')
+    parser.add_argument('-u', '--username', default="admin", help='Username')
+    parser.add_argument('-w', '--password', default="admin", help='Password')
+
+    args = parser.parse_args()
+
+    ret = 1
+
+    # import pdb; pdb.set_trace()
+    url = "https://%s:%s" % (args.server, args.port)
+    c = client.RestClient(url, args.debug)
+
+    try:
+        token = c.login(args.username, args.password)
+    except client.RestException as e:
+        print("Error: " + e.msg)
+        sys.exit(ret)
+
+    # List all container IDs
+    if list_containers(c):
+        ret = 0
+
+    try:
+        c.logout()
+    except client.RestException:
+        pass
+
+    sys.exit(ret)
