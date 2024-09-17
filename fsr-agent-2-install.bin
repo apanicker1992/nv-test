@@ -1,0 +1,595 @@
+#!/bin/bash
+# Copyright start
+# Copyright (C) 2008 - 2024 Fortinet Inc.
+# All rights reserved.
+# FORTINET CONFIDENTIAL & FORTINET PROPRIETARY SOURCE CODE
+# Copyright end
+
+agent_user="fortisoar"
+agent_group="fortisoar"
+prefix="/opt/cyops-integrations/"
+f_cmd_psql="/usr/bin/psql"
+pg_version=16
+pg_hba_file="/var/lib/pgsql/$pg_version/data/pg_hba.conf"
+product_version="7.6.0"
+pg_password="6eb890658a773e6ec93c82e35fb2d6af"
+agent_id="6eb890658a773e6ec93c82e35fb2d6af"
+agent_rpm_name="cyops-integrations-agent"
+product_yum_server="repo.fortisoar.fortinet.com"
+secure_message_exchange_host="FortiSOAR-RockyLinux"
+pwd=$(pwd)
+config_update="False"
+
+# Code -1 Pre validation failed
+# Code 1 means pre-installation
+# Code 2 means post installation
+# Code 3 means agent upgrade successful
+# Code 4 means upgrade failed or service restart failed
+# Code 5 means agent config update is in progress
+# Code 6 means agent config update successful
+# Code 7 means agent config update failed
+
+install_basic_package() {
+  yum install -y which tar sudo
+}
+
+identify_bytes_to_skip() {
+  i_bytes_to_skip=$(awk '/^__PAYLOAD_STARTS_AFTER_THIS__/ { print NR; exit 0; }' $0)
+  c_first_char=$(echo $0 | cut -c 1)
+  if [ "$c_first_char" = "/" ]; then
+    script=$0
+  else
+    script=$(pwd)/$0
+  fi
+  export script
+  export i_bytes_to_skip
+}
+
+check_if_upgrade() {
+  is_upgrade=0
+  if rpm -qa | grep -q $agent_rpm_name; then
+    is_upgrade=1
+  fi
+}
+
+extract_archive() {
+
+  if ! which tar; then
+    echo "Please ensure the tar command is installed on your machine"
+    if [ $is_upgrade -eq 1 ]; then
+      /opt/cyops-integrations/.env/bin/python $prefix/agent_helper.py '{"code": -1, "status": "tar command not found on the FortiSOAR agent instance"}'
+    fi
+    exit 1
+  fi
+
+  sed "1,${i_bytes_to_skip}d" $script | tar -xzf - 2>/dev/null
+  if [ $? -ne 0 ]; then
+    echo "Extract archive failed, exiting"
+    exit 1
+  fi
+}
+
+identify_existing_agent() {
+  if [ $is_upgrade -eq 1 ]; then
+    old_agent_id=$(/opt/cyops-integrations/.env/bin/python $prefix/agent_helper.py '{"get_config_key": true, "key_name": "cyops.instance.agentId"}')
+    if [ "$agent_id" != "$old_agent_id" ]; then
+      echo "Found an existing installation of FortiSOAR agent with a different agent ID. The installer will exit."
+      echo "Possibly you are running the installer for another agent connected to your FortiSOAR server. Check and download the correct agent installer."
+      echo "Or, if you wish to reset the installation with the new agent ID, execute the following commands manually and then re-run the installer script."
+      echo -e "\n\n"
+      echo "rm -rf /var/lib/pgsql/$pg_version/data/"
+      echo "/usr/pgsql-$pg_version/bin/postgresql-$pg_version-setup initdb"
+
+      echo "systemctl restart postgresql-$pg_version.service"
+
+      echo "sudo -Hiu postgres psql -c 'DROP USER IF EXISTS cyberpgsql;'"
+      echo "sudo -Hiu postgres psql -U postgres -c \"CREATE USER cyberpgsql WITH SUPERUSER PASSWORD '$pg_password'\""
+      echo "sudo -Hiu postgres psql -c 'DROP DATABASE IF EXISTS connectors;'"
+      echo "sudo -Hiu postgres createdb connectors 'cyberpgsql'"
+
+      echo "> /var/lib/pgsql/$pg_version/data/pg_hba.conf"
+      echo "echo -e \"local   all             postgres                                md5 \n\nlocal   all             cyberpgsql                              md5 \n\nhost    all             cyberpgsql             127.0.0.1/32     md5\n\nhost    all             cyberpgsql             ::1/128          md5\" > /var/lib/pgsql/$pg_version/data/pg_hba.conf"
+      echo "chown postgres:postgres /var/lib/pgsql/$pg_version/data/pg_hba.conf"
+      echo "chmod 600 /var/lib/pgsql/$pg_version/data/pg_hba.conf"
+      echo "systemctl restart postgresql-$pg_version.service"
+      echo "Once done please update the new agent id in /opt/cyops-integrations/integrations/configs/agent_config.yml under cyops.instance.agentId"
+      exit 1
+    fi
+  fi
+}
+
+pre_validate_script() {
+
+  if ! curl -I --silent --connect-timeout 10 https://$product_yum_server -k >/dev/null; then
+    echo "======================================================================================================"
+    echo "Please ensure connectivity to $product_yum_server for agent installation"
+    echo "======================================================================================================"
+    if [ $is_upgrade -eq 1 ]; then
+      /opt/cyops-integrations/.env/bin/python $prefix/agent_helper.py '{"code": -1, "status": "Unable to reach FortiSOAR yum server"}'
+    fi
+    exit 1
+  fi
+
+  if ! getent hosts $secure_message_exchange_host; then
+    echo "=================================================================================================="
+    echo "The Secure Message Exchange server $secure_message_exchange_host is not resolvable from this host."
+    echo "It is recommended to establish the connectivity to the router before running the agent installer."
+    echo "=================================================================================================="
+    echo "Exit the installer (y/n)?"
+    read -n 1 -r
+    if [[ $REPLY =~ ^[Yy]$ ]]; then
+      echo -e '\n'
+      exit 1
+    fi
+  fi
+
+  if [ $is_upgrade -eq 1 ]; then
+    /opt/cyops-integrations/.env/bin/python $prefix/agent_helper.py '{"code": 1, "status": "Verified connectivity with FortiSOAR server"}'
+  fi
+}
+
+disable_existing_postgres_repo() {
+  # For Fix of following error
+  # All matches were filtered out by modular filtering for argument: postgresql14-server
+  sudo dnf -qy module disable postgresql
+  yum clean all
+}
+
+add_enable_repo() {
+  app_repo="[fsr-app]
+name=FortiSOAR Application Repository
+baseurl=https://$product_yum_server/$product_version/fortisoar/x86_64/
+gpgcheck=0
+enabled=1
+sslverify=false"
+
+  postgres_repo="[fsr-pgdg]
+name=FortiSOAR PostgreSQL repository
+baseurl=https://$product_yum_server/$product_version/third-party/postgres/pgdg$pg_version/
+enabled=1
+gpgcheck=1
+gpgkey=https://$product_yum_server/$product_version/third-party/postgres/RPM-GPG-KEY-PGDG-$pg_version
+sslverify=false"
+
+  echo "$app_repo" >/etc/yum.repos.d/fsr-app.repo
+  echo "$postgres_repo" >/etc/yum.repos.d/fsr-third-party.repo
+
+  sudo chmod 644 /etc/yum.repos.d/fsr-app.repo
+  sudo chmod 644 /etc/yum.repos.d/fsr-third-party.repo
+
+  yum clean all
+}
+
+install_configure_postgres() {
+  if ! rpm -qa | grep -q postgresql$pg_version-server; then
+    echo "======================================================================================================"
+    echo "Installing Postgres Server"
+    echo "======================================================================================================"
+    yum install -y postgresql$pg_version-server --nogpgcheck
+    if [ $? -ne 0 ]; then
+      echo "Unable to install PostgreSQL, Exiting the installer"
+      echo "Validate connectivity with $product_yum_server or check host entry"
+      exit 1
+    fi
+
+    #pg setup
+    /usr/pgsql-$pg_version/bin/postgresql-$pg_version-setup initdb
+    systemctl enable postgresql-$pg_version
+
+    if [ $is_upgrade -ne 1 ]; then
+      systemctl start postgresql-$pg_version.service
+      # create pg user
+      sudo -Hiu postgres psql -c 'DROP USER IF EXISTS cyberpgsql;'
+      sudo -Hiu postgres psql -U postgres -c "CREATE USER cyberpgsql WITH SUPERUSER PASSWORD '$pg_password'"
+      sudo -Hiu postgres psql -c 'DROP DATABASE IF EXISTS connectors;'
+      sudo -Hiu postgres createdb connectors 'cyberpgsql'
+    fi
+
+    pg_hba='local   all             postgres                                md5
+
+local   all             cyberpgsql                              md5
+
+host    all             cyberpgsql             127.0.0.1/32     md5
+
+host    all             cyberpgsql             ::1/128          md5
+'
+    >/var/lib/pgsql/$pg_version/data/pg_hba.conf
+    echo "$pg_hba" >/var/lib/pgsql/$pg_version/data/pg_hba.conf
+    chown postgres:postgres /var/lib/pgsql/$pg_version/data/pg_hba.conf
+    chmod 600 /var/lib/pgsql/$pg_version/data/pg_hba.conf
+
+    systemctl restart postgresql-$pg_version.service
+  fi
+}
+
+install_upgrade_agent() {
+  if rpm -qa | grep -q $agent_rpm_name; then
+    echo "Current version:" $(rpm -q --qf '%{version}' $agent_rpm_name)
+    if [ $is_upgrade -eq 1 ]; then
+      /opt/cyops-integrations/.env/bin/python $prefix/agent_helper.py '{"code": 1, "status": "Pre-validation done, starting agent upgrade."}'
+    fi
+    yum update -y $agent_rpm_name --nogpgcheck
+    if [ $? -ne 0 ]; then
+      if [ $is_upgrade -eq 1 ]; then
+        /opt/cyops-integrations/.env/bin/python $prefix/agent_helper.py '{"code": 4, "status": "Failed to upgrade the agent rpm package"}'
+        /opt/cyops-integrations/.env/bin/python $prefix/agent_helper.py '{"collect_log": true, "log_path": "/var/log/cyops"}'
+      fi
+      exit 1
+    fi
+    systemctl daemon-reload
+  else
+    yum install -y $agent_rpm_name --nogpgcheck
+    if [ $? -ne 0 ]; then
+      exit 1
+    fi
+    systemctl enable $agent_rpm_name
+  fi
+}
+
+remove_repo() {
+  rm -f /etc/yum.repos.d/fsr-app.repo
+  rm -f /etc/yum.repos.d/fsr-third-party.repo
+
+  if [ $is_upgrade -eq 1 ]; then
+    echo "Notifying master: removing the added yum repos"
+    sudo -u $agent_user /opt/cyops-integrations/.env/bin/python $prefix/agent_helper.py '{"code": 1, "status": "Removing added repos"}'
+  fi
+}
+
+write_config_file() {
+  agent_config='cyops.instance.agentId: 6eb890658a773e6ec93c82e35fb2d6af
+cyops.instance.agentUuid: 973c17df-bb4b-41e5-b59c-a408666fdf27
+cyops.instance.lwAgent: true
+cyops.instance.masterId: 6c19153e9f2f5dd437663e6306fc9b5d
+cyops.instance.tenantUuid: 5cb929dd-8c88-43d0-8a88-75a29c87b4f6
+cyops.rabbitmq.authType: /api/3/picklists/0ec67016-990f-4117-a599-7b12a259d3d3
+cyops.rabbitmq.heartbeat: 120
+cyops.rabbitmq.host: FortiSOAR-RockyLinux
+cyops.rabbitmq.password: +GxSES3ehJt+MC4lIIwAYUlM4mTuJVUrV82rTUxMDKVgpV+XeBtQyoCavF0qe209I3dmcn23@KlS2#!ck
+cyops.rabbitmq.port: 5671
+cyops.rabbitmq.sni: FortiSOAR-RockyLinux
+cyops.rabbitmq.ssl: true
+cyops.rabbitmq.sslFileName: /opt/cyops-integrations/integrations/configs/ca_cert.pem
+cyops.rabbitmq.user: user_6eb890658a773e6ec93c82e35fb2d6af
+cyops.rabbitmq.vhost: vhost_6eb890658a773e6ec93c82e35fb2d6af
+postgres.pg_host: localhost
+postgres.pg_password: 6eb890658a773e6ec93c82e35fb2d6af
+postgres.pg_user: cyberpgsql
+'
+  ca_cert='-----BEGIN CERTIFICATE-----
+MIIC2TCCAcGgAwIBAgIUc1ggVetba0NYP8/LzB5wsEyvgGgwDQYJKoZIhvcNAQEL
+BQAwFzEVMBMGA1UEAwwMRlNSRGVmYXVsdENBMB4XDTI0MDUyOTA3MTgzNloXDTI2
+MDUyOTA3MTgzNlowFzEVMBMGA1UEAwwMRlNSRGVmYXVsdENBMIIBIjANBgkqhkiG
+9w0BAQEFAAOCAQ8AMIIBCgKCAQEAyCHQHScoh/VrFvujBMRSYKyhfmL9voXtRNFk
+GChIOBhDPg+ikSC9Y1sGZ8TYeHKSfqpLFgVlbrfZ8H3xzhHuEwwZGEKVsDYPl/e8
+tTJf2v64y+C/OT0WRGmLnj+YKfd9FwvoXIgrgbP1zTPls0JKNLRjgfdVYM60zU1k
+meTRC0m6748ojAd+N+p12SMEe7i5u1/x9pJleW4qDW2Ryar49XwGgBRBKlUo4HZa
+ugbr3x/OuNtNuMr8Ba21vHlwmhTS3tXNGsUexMTFyhqaBsRRjpyO4m+PVRQxg13K
+6muJndVtmvn0Kvb+cshNvHaAnr51p1LsV3VdyNS3ttHdc56aqwIDAQABox0wGzAM
+BgNVHRMEBTADAQH/MAsGA1UdDwQEAwIBBjANBgkqhkiG9w0BAQsFAAOCAQEAoSFi
+5YI3PHa2KCOg5WNWLx1dxwVrv6pD7RjYbfOHcX8SBPs+xUtxazI+07frVkscIaOZ
+Nn96pFMtm1TcoRSnxgoxGIOQhJe+of9o+US7f+/5LLbaEHpFkp8SNkF+SinMaf9q
+LeVHaJWRZEXp+viUnNbJo+3dMnJ7JKnuBHJTz/LI3GOuzJ4X9m4OQDU6KwA2TTbM
+ZVYFkKx52n6H9FA1Gz2XQ+9XSI8uDLxhh6yL6FFCIv1tWHm0AGGlUwX3HeTTPsEE
+vaT+YudXwbuoiKSZbCFdLxU27DIhWLh4SRYXrpQ16SMIejsIe/JpYQuNxhSUxmrO
+bDU361KHxdy8sXMvXA==
+-----END CERTIFICATE-----'
+  client_cert='@client_cert@'
+  client_key='@client_key@'
+  connectors=$(
+    cat <<EOF
+[{"name": "sophos-xg", "version": "1.0.0", "rpm_full_name": "", "configurations": [{"id": 54, "config_id": "87b30bea-c6d0-4288-9d1b-708c2eef9493", "name": "sophos-test", "default": false, "config": {"port": 4444, "address": "192.168.79.193", "password": "NULL", "username": "admin.sophos", "ip_policy": "", "app_policy": "", "url_policy": "Blocked URLs for Default Policy", "verify_ssl": false}, "connector": 463, "status": 1, "agent": "6eb890658a773e6ec93c82e35fb2d6af"}], "rpm_installed": true}, {"name": "cyops_utilities", "version": "3.2.6", "rpm_full_name": "", "configurations": [], "rpm_installed": true}, {"name": "fsr-agent-communication-bridge", "version": "1.1.0", "rpm_full_name": "", "configurations": [], "rpm_installed": true}, {"name": "fortigate-firewall", "version": "5.2.3", "rpm_full_name": "", "configurations": [{"id": 30, "config_id": "10675f33-f24d-46d6-a45c-23977bd5c5ff", "name": "Forigate-FW-on-prem", "default": true, "config": {"port": 10443, "vdom": "\"root\"", "address": "https://192.168.79.1", "api_key": "NULL", "verify_ssl": false, "app_block_policy": "", "url_block_policy": ""}, "connector": 429, "status": 1, "agent": "6eb890658a773e6ec93c82e35fb2d6af"}], "rpm_installed": true}, {"name": "activedirectory", "version": "2.4.0", "rpm_full_name": "", "configurations": [{"id": 31, "config_id": "13270176-bf8b-4880-849d-71346f0b8d03", "name": "AD-on Prem", "default": true, "config": {"port": 389, "baseDN": "DC=dubai,DC=skyarch, DC=com", "bindDN": "", "use_tls": false, "hostname": "192.168.79.190", "password": "v1RL6NjbRXGfRHo2cpB8dvAHwmvwfYdQxOVumA==I3dmcn23@KlS2#!ck", "username": "DUBAI\\fsr-ad"}, "connector": 430, "status": 1, "agent": "6eb890658a773e6ec93c82e35fb2d6af"}], "rpm_installed": true}, {"name": "code-snippet", "version": "2.1.1", "rpm_full_name": "", "configurations": [{"id": 32, "config_id": "712926f4-2bbd-4ba1-88fc-1831281a5e84", "name": "AD-on Prem-python", "default": false, "config": {"allow_imports": "ldap"}, "connector": 431, "status": 1, "agent": "6eb890658a773e6ec93c82e35fb2d6af"}], "rpm_installed": true}, {"name": "activedirectory_dev", "version": "2.4.2", "rpm_full_name": "", "configurations": [{"id": 35, "config_id": "4d25b5ea-1491-4dab-a299-c4f0ec4deaad", "name": "AD-on Prem", "default": false, "config": {"port": 389, "baseDN": "DC=dubai, DC=skyarch, DC=com", "bindDN": "", "use_tls": false, "hostname": "192.168.79.190", "password": "eifnyw5sJtQ+EzYMRYGuQBYwBFp+wChl1EGylA==I3dmcn23@KlS2#!ck", "username": "DUBAI\\fsr-ad"}, "connector": 434, "status": 1, "agent": "6eb890658a773e6ec93c82e35fb2d6af"}, {"id": 33, "config_id": "ab3b0bd3-abde-40fa-a4f6-353b331fcc58", "name": "test_dev_2", "default": true, "config": {"port": 389, "baseDN": "DC=dubai, DC=skyarch, DC=com", "bindDN": "", "use_tls": false, "hostname": "192.168.79.190", "password": "NULL", "username": "DUBAI\\fsr-ad"}, "connector": 434, "status": 1, "agent": "6eb890658a773e6ec93c82e35fb2d6af"}], "rpm_installed": false}, {"name": "eventlogger", "version": "1.0.0", "rpm_full_name": "", "configurations": [{"id": 52, "config_id": "d4744b59-9231-4b67-9068-9576a5367743", "name": "AD-on Prem55", "default": false, "config": {"port": "443", "password": "mjubUezdeLfI8ty2p1UcGWN2sJJL+pkk+AAD4w==I3dmcn23@KlS2#!ck", "username": "csadmin", "verify_ssl": "", "server_address": "192.168.79.190"}, "connector": 450, "status": 1, "agent": "6eb890658a773e6ec93c82e35fb2d6af"}, {"id": 42, "config_id": "f16f9f3e-705d-4db2-ad27-745b25d58c7a", "name": "AD-on Prem", "default": true, "config": {"port": "443", "password": "NULL", "username": "DUBAI\\fsr-ad", "verify_ssl": "", "server_address": "192.168.79.190"}, "connector": 450, "status": 1, "agent": "6eb890658a773e6ec93c82e35fb2d6af"}], "rpm_installed": false}, {"name": "syslog", "version": "1.1.1", "rpm_full_name": "", "configurations": [{"id": 38, "config_id": "3f4006c6-1206-45f9-aa73-ffea2145c182", "name": "Syslog-Windows", "default": false, "config": {"port": 1514, "trigger": "syslog", "protocol": "UDP", "filter_str": ""}, "connector": 445, "status": 1, "agent": "6eb890658a773e6ec93c82e35fb2d6af"}], "rpm_installed": true}]
+EOF
+  )
+
+  echo "$agent_config" >/opt/cyops-integrations/integrations/configs/agent_config.yml
+  echo "$ca_cert" >/opt/cyops-integrations/integrations/configs/ca_cert.pem
+  echo "$client_cert" >/opt/cyops-integrations/integrations/configs/client-cert.pem
+  echo "$client_key" >/opt/cyops-integrations/integrations/configs/client-key.pem
+  echo "$connectors" >/opt/cyops-integrations/integrations/connectors.json
+}
+
+write_tmp_dir(){
+  mkdir -p /opt/cyops-integrations/integrations/configs/tmp
+}
+
+del_tmp_dir(){
+  rm -rf /opt/cyops-integrations/integrations/configs/tmp
+}
+
+write_tmp_config_file(){
+  write_tmp_dir
+  agent_config='cyops.instance.agentId: 6eb890658a773e6ec93c82e35fb2d6af
+cyops.instance.agentUuid: 973c17df-bb4b-41e5-b59c-a408666fdf27
+cyops.instance.lwAgent: true
+cyops.instance.masterId: 6c19153e9f2f5dd437663e6306fc9b5d
+cyops.instance.tenantUuid: 5cb929dd-8c88-43d0-8a88-75a29c87b4f6
+cyops.rabbitmq.authType: /api/3/picklists/0ec67016-990f-4117-a599-7b12a259d3d3
+cyops.rabbitmq.heartbeat: 120
+cyops.rabbitmq.host: FortiSOAR-RockyLinux
+cyops.rabbitmq.password: +GxSES3ehJt+MC4lIIwAYUlM4mTuJVUrV82rTUxMDKVgpV+XeBtQyoCavF0qe209I3dmcn23@KlS2#!ck
+cyops.rabbitmq.port: 5671
+cyops.rabbitmq.sni: FortiSOAR-RockyLinux
+cyops.rabbitmq.ssl: true
+cyops.rabbitmq.sslFileName: /opt/cyops-integrations/integrations/configs/ca_cert.pem
+cyops.rabbitmq.user: user_6eb890658a773e6ec93c82e35fb2d6af
+cyops.rabbitmq.vhost: vhost_6eb890658a773e6ec93c82e35fb2d6af
+postgres.pg_host: localhost
+postgres.pg_password: 6eb890658a773e6ec93c82e35fb2d6af
+postgres.pg_user: cyberpgsql
+'
+  ca_cert='-----BEGIN CERTIFICATE-----
+MIIC2TCCAcGgAwIBAgIUc1ggVetba0NYP8/LzB5wsEyvgGgwDQYJKoZIhvcNAQEL
+BQAwFzEVMBMGA1UEAwwMRlNSRGVmYXVsdENBMB4XDTI0MDUyOTA3MTgzNloXDTI2
+MDUyOTA3MTgzNlowFzEVMBMGA1UEAwwMRlNSRGVmYXVsdENBMIIBIjANBgkqhkiG
+9w0BAQEFAAOCAQ8AMIIBCgKCAQEAyCHQHScoh/VrFvujBMRSYKyhfmL9voXtRNFk
+GChIOBhDPg+ikSC9Y1sGZ8TYeHKSfqpLFgVlbrfZ8H3xzhHuEwwZGEKVsDYPl/e8
+tTJf2v64y+C/OT0WRGmLnj+YKfd9FwvoXIgrgbP1zTPls0JKNLRjgfdVYM60zU1k
+meTRC0m6748ojAd+N+p12SMEe7i5u1/x9pJleW4qDW2Ryar49XwGgBRBKlUo4HZa
+ugbr3x/OuNtNuMr8Ba21vHlwmhTS3tXNGsUexMTFyhqaBsRRjpyO4m+PVRQxg13K
+6muJndVtmvn0Kvb+cshNvHaAnr51p1LsV3VdyNS3ttHdc56aqwIDAQABox0wGzAM
+BgNVHRMEBTADAQH/MAsGA1UdDwQEAwIBBjANBgkqhkiG9w0BAQsFAAOCAQEAoSFi
+5YI3PHa2KCOg5WNWLx1dxwVrv6pD7RjYbfOHcX8SBPs+xUtxazI+07frVkscIaOZ
+Nn96pFMtm1TcoRSnxgoxGIOQhJe+of9o+US7f+/5LLbaEHpFkp8SNkF+SinMaf9q
+LeVHaJWRZEXp+viUnNbJo+3dMnJ7JKnuBHJTz/LI3GOuzJ4X9m4OQDU6KwA2TTbM
+ZVYFkKx52n6H9FA1Gz2XQ+9XSI8uDLxhh6yL6FFCIv1tWHm0AGGlUwX3HeTTPsEE
+vaT+YudXwbuoiKSZbCFdLxU27DIhWLh4SRYXrpQ16SMIejsIe/JpYQuNxhSUxmrO
+bDU361KHxdy8sXMvXA==
+-----END CERTIFICATE-----'
+  client_cert='@client_cert@'
+  client_key='@client_key@'
+  connectors=$(
+    cat <<EOF
+[{"name": "sophos-xg", "version": "1.0.0", "rpm_full_name": "", "configurations": [{"id": 54, "config_id": "87b30bea-c6d0-4288-9d1b-708c2eef9493", "name": "sophos-test", "default": false, "config": {"port": 4444, "address": "192.168.79.193", "password": "NULL", "username": "admin.sophos", "ip_policy": "", "app_policy": "", "url_policy": "Blocked URLs for Default Policy", "verify_ssl": false}, "connector": 463, "status": 1, "agent": "6eb890658a773e6ec93c82e35fb2d6af"}], "rpm_installed": true}, {"name": "cyops_utilities", "version": "3.2.6", "rpm_full_name": "", "configurations": [], "rpm_installed": true}, {"name": "fsr-agent-communication-bridge", "version": "1.1.0", "rpm_full_name": "", "configurations": [], "rpm_installed": true}, {"name": "fortigate-firewall", "version": "5.2.3", "rpm_full_name": "", "configurations": [{"id": 30, "config_id": "10675f33-f24d-46d6-a45c-23977bd5c5ff", "name": "Forigate-FW-on-prem", "default": true, "config": {"port": 10443, "vdom": "\"root\"", "address": "https://192.168.79.1", "api_key": "NULL", "verify_ssl": false, "app_block_policy": "", "url_block_policy": ""}, "connector": 429, "status": 1, "agent": "6eb890658a773e6ec93c82e35fb2d6af"}], "rpm_installed": true}, {"name": "activedirectory", "version": "2.4.0", "rpm_full_name": "", "configurations": [{"id": 31, "config_id": "13270176-bf8b-4880-849d-71346f0b8d03", "name": "AD-on Prem", "default": true, "config": {"port": 389, "baseDN": "DC=dubai,DC=skyarch, DC=com", "bindDN": "", "use_tls": false, "hostname": "192.168.79.190", "password": "v1RL6NjbRXGfRHo2cpB8dvAHwmvwfYdQxOVumA==I3dmcn23@KlS2#!ck", "username": "DUBAI\\fsr-ad"}, "connector": 430, "status": 1, "agent": "6eb890658a773e6ec93c82e35fb2d6af"}], "rpm_installed": true}, {"name": "code-snippet", "version": "2.1.1", "rpm_full_name": "", "configurations": [{"id": 32, "config_id": "712926f4-2bbd-4ba1-88fc-1831281a5e84", "name": "AD-on Prem-python", "default": false, "config": {"allow_imports": "ldap"}, "connector": 431, "status": 1, "agent": "6eb890658a773e6ec93c82e35fb2d6af"}], "rpm_installed": true}, {"name": "activedirectory_dev", "version": "2.4.2", "rpm_full_name": "", "configurations": [{"id": 35, "config_id": "4d25b5ea-1491-4dab-a299-c4f0ec4deaad", "name": "AD-on Prem", "default": false, "config": {"port": 389, "baseDN": "DC=dubai, DC=skyarch, DC=com", "bindDN": "", "use_tls": false, "hostname": "192.168.79.190", "password": "eifnyw5sJtQ+EzYMRYGuQBYwBFp+wChl1EGylA==I3dmcn23@KlS2#!ck", "username": "DUBAI\\fsr-ad"}, "connector": 434, "status": 1, "agent": "6eb890658a773e6ec93c82e35fb2d6af"}, {"id": 33, "config_id": "ab3b0bd3-abde-40fa-a4f6-353b331fcc58", "name": "test_dev_2", "default": true, "config": {"port": 389, "baseDN": "DC=dubai, DC=skyarch, DC=com", "bindDN": "", "use_tls": false, "hostname": "192.168.79.190", "password": "NULL", "username": "DUBAI\\fsr-ad"}, "connector": 434, "status": 1, "agent": "6eb890658a773e6ec93c82e35fb2d6af"}], "rpm_installed": false}, {"name": "eventlogger", "version": "1.0.0", "rpm_full_name": "", "configurations": [{"id": 52, "config_id": "d4744b59-9231-4b67-9068-9576a5367743", "name": "AD-on Prem55", "default": false, "config": {"port": "443", "password": "mjubUezdeLfI8ty2p1UcGWN2sJJL+pkk+AAD4w==I3dmcn23@KlS2#!ck", "username": "csadmin", "verify_ssl": "", "server_address": "192.168.79.190"}, "connector": 450, "status": 1, "agent": "6eb890658a773e6ec93c82e35fb2d6af"}, {"id": 42, "config_id": "f16f9f3e-705d-4db2-ad27-745b25d58c7a", "name": "AD-on Prem", "default": true, "config": {"port": "443", "password": "NULL", "username": "DUBAI\\fsr-ad", "verify_ssl": "", "server_address": "192.168.79.190"}, "connector": 450, "status": 1, "agent": "6eb890658a773e6ec93c82e35fb2d6af"}], "rpm_installed": false}, {"name": "syslog", "version": "1.1.1", "rpm_full_name": "", "configurations": [{"id": 38, "config_id": "3f4006c6-1206-45f9-aa73-ffea2145c182", "name": "Syslog-Windows", "default": false, "config": {"port": 1514, "trigger": "syslog", "protocol": "UDP", "filter_str": ""}, "connector": 445, "status": 1, "agent": "6eb890658a773e6ec93c82e35fb2d6af"}], "rpm_installed": true}]
+EOF
+  )
+  echo "$agent_config" >/opt/cyops-integrations/integrations/configs/tmp/agent_config.yml
+  echo "$ca_cert" >/opt/cyops-integrations/integrations/configs/tmp/ca_cert.pem
+  echo "$client_cert" >/opt/cyops-integrations/integrations/configs/tmp/client-cert.pem
+  echo "$client_key" >/opt/cyops-integrations/integrations/configs/tmp/client-key.pem
+  sed -i "s/\(\/opt\/cyops\-integrations\/integrations\/configs\/\)/\1tmp\//g" /opt/cyops-integrations/integrations/configs/tmp/agent_config.yml
+}
+
+can_connect_sme(){
+    sudo -u $agent_user /opt/cyops-integrations/.env/bin/python $prefix/agent_helper.py "{\"code\": 1, \"status\": \"Checking if Agent can connect to SME host $(secure_message_exchange_host)\"}"
+    echo "Checking if agent can connect to SME"
+    sme_health=$(/opt/cyops-integrations/.env/bin/python $prefix/agent_helper.py '{"sme_health_check": true}')
+    if [ "X$sme_health" != "XTrue" ]; then
+        echo "Cannot connect to SME. Exiting update"
+        sudo -u $agent_user /opt/cyops-integrations/.env/bin/python $prefix/agent_helper.py "{\"code\": 7, \"status\": \"FortiSOAR Agent instance cannot connect to SME host $(secure_message_exchange_host)\"}"
+        exit 1
+    fi
+    /opt/cyops-integrations/.env/bin/python $prefix/agent_helper.py "{\"code\": 5, \"status\": \"FortiSOAR Agent instance can connect to SME host $(secure_message_exchange_host)\"}"
+    echo "Agent can connect to SME"
+    del_tmp_dir
+}
+
+restart_service() {
+  # restart service
+  echo "restarting services"
+  if [ ! "$1" = "skip_postgres_restart" ]; then
+    echo "Skipping PostgreSQL restart on subsequent restart request from installer"
+    systemctl restart postgresql-$pg_version
+  fi
+  systemctl restart $agent_rpm_name
+  if [ $? -ne 0 ]; then
+    if [ $is_upgrade -eq 1 ]; then
+      sudo -u $agent_user /opt/cyops-integrations/.env/bin/python $prefix/agent_helper.py '{"code": 4, "status": "Agent service failed to start"}'
+      sudo -u $agent_user /opt/cyops-integrations/.env/bin/python $prefix/agent_helper.py '{"collect_log": true, "log_path": "/var/log/cyops"}'
+    fi
+  fi
+}
+
+databse_migrate() {
+  if [ $is_upgrade -eq 1 ]; then
+    echo "Notifying master: starting database migrations"
+    sudo -u $agent_user /opt/cyops-integrations/.env/bin/python $prefix/agent_helper.py '{"code": 2, "status": "Starting database migrations"}'
+  fi
+
+  # run migration
+  cd $prefix/integrations
+  sudo -u $agent_user $prefix/.env/bin/python3 manage.py migrate
+
+  if [ $is_upgrade -eq 1 ]; then
+    echo "Notifying master: completed database migrations"
+    sudo -u $agent_user /opt/cyops-integrations/.env/bin/python $prefix/agent_helper.py '{"code": 2, "status": "Completed database migration"}'
+  fi
+}
+
+create_cache_table() {
+  # create cache table
+  cd $prefix/integrations
+  sudo -u $agent_user $prefix/.env/bin/python3 manage.py createcachetable
+
+}
+
+install_gcc() {
+  rpm -q gcc >/dev/null
+  if [ $? -ne 0 ]; then
+    echo "======================================================================================================"
+    echo "attempting to install gcc"
+    echo "======================================================================================================"
+    yum install -y gcc >/dev/null 2>&1
+
+    if [ 0 -ne $? ]; then
+      echo "======================================================================================================"
+      echo "Failed to install GCC rpm. Some of the FortiSOAR connectors may have a dependency on gcc."
+      echo "It is recommended to install gcc by enabling the CentOS yum repositories on this instance and running 'yum install gcc -y'"
+      echo "======================================================================================================"
+    else
+      echo "successfully installed gcc"
+    fi
+  fi
+}
+
+install_update_connectors() {
+  cd /opt/cyops-integrations
+  if [ $is_upgrade -eq 1 ]; then
+    echo "Notifying master: updated utilities connector"
+    sudo -u $agent_user /opt/cyops-integrations/.env/bin/python $prefix/agent_helper.py '{"code": 2, "status": "Updating utilities connector"}'
+  fi
+  echo "Installing specified connectors"
+  sudo -u $agent_user /opt/cyops-integrations/.env/bin/python /opt/cyops-integrations/integrations/manage.py install_connector
+}
+
+install_connector_dep() {
+  echo "installing integration pip packages"
+  for requirements in $(find /opt/cyops/configs/integrations/connectors/ -name requirements.txt); do sudo -u fortisoar /opt/cyops-integrations/.env/bin/pip install -r $requirements; done
+}
+
+collect_logs() {
+  echo "Agent Deployed Successfully"
+  if [ $is_upgrade -eq 1 ]; then
+    sudo -u $agent_user /opt/cyops-integrations/.env/bin/python $prefix/agent_helper.py '{"code": 3, "status": "Agent upgraded successfully!"}'
+    sudo -u $agent_user /opt/cyops-integrations/.env/bin/python $prefix/agent_helper.py '{"collect_log": true, "log_path": "/var/log/cyops"}'
+  fi
+}
+
+post_config_update() {
+  echo "Agent configuration refreshed successfully"
+  sudo -u $agent_user /opt/cyops-integrations/.env/bin/python $prefix/agent_helper.py '{"code": 6, "status": "Agent configuration refreshed successfully!"}'
+  sudo -u $agent_user /opt/cyops-integrations/.env/bin/python $prefix/agent_helper.py '{"collect_log": true, "log_path": "/var/log/cyops"}'
+}
+
+move_file_to_integration() {
+  if [[ -d $prefix ]]; then
+    mv $pwd/agent_helper.py $prefix
+  fi
+}
+
+change_file_ownership() {
+  # reset all file ownership to FortiSOAR user in case new files have been created
+  chown -R $agent_user:$agent_group $prefix
+  restorecon -R $prefix
+  chown -R $agent_user:$agent_group /var/log/cyops/
+  restorecon -R $prefix /var/log/cyops
+}
+
+set_locale() {
+  export LANG=en_US.UTF-8
+  export LANGUAGE=en_US.UTF-8
+  export LC_COLLATE=C
+  export LC_CTYPE=en_US.UTF-8
+}
+
+create_csagent_symlink() {
+  ln -sf /opt/cyops-integrations/integrations/cs_sdk.py /usr/bin/csagent
+}
+
+version_compare() {
+    local s_ver1=$1
+    local s_ver2=$2
+    local a_ver1=($(echo $s_ver1 | tr '.' "\n"))
+    local a_ver2=($(echo $s_ver2 | tr '.' "\n"))
+    local i_no_of_ele_ver1=${#a_ver1[@]}
+    local i_no_of_ele_ver2=${#a_ver2[@]}
+    local i_result=0
+    if [ "X$i_no_of_ele_ver1" != "X$i_no_of_ele_ver2" ]; then
+        echo -e "version_compare sub-routine needs identical number of elements"
+        my_exit 1
+    fi
+
+    for ((i = 0; i < $i_no_of_ele_ver1; i++)); do
+        if [ ${a_ver1[$i]} -eq ${a_ver2[$i]} ]; then
+            continue
+        fi
+        if [ ${a_ver1[$i]} -gt ${a_ver2[$i]} ]; then
+            #version 1 is greater
+            i_result=1
+        else
+            #version 2 is greater
+            i_result=2
+        fi
+        break
+    done
+    echo $i_result
+}
+
+check_kernel_version() {
+    echo "------------------------------"
+    echo "Operating System Support Check"
+    echo "------------------------------"
+    current_kernel_version=`uname -r |cut -d- -f1`
+    supported_kernel_version='5.14.0'
+    status=$(version_compare $supported_kernel_version $current_kernel_version)
+    if [ $? -ne 0 ]; then
+        echo "Failed to compare the version"
+        exit 1
+    fi
+    if [ $status -eq 1 ]; then
+        # Installed version is less than 7.0.0
+        echo "Error: Found kernel version $current_kernel_version."
+        echo "Version $product_version agent installer is only supported for Linux kernel versions $supported_kernel_version or higher. You must re-run the installer on a new VM with Redhat/Alma/Rocky Linux 9 as the base Operating System"
+        exit 1
+    else
+        echo "Current Kernel version $current_kernel_version is supported for agent installation"
+    fi
+}
+
+f_script_name="agent-$product_version"
+time_stamp=$(date +"%F"-"%s")
+mkdir -p /var/log/cyops
+f_log="/var/log/cyops/${f_script_name}-${time_stamp}.log"
+touch $f_log
+f_file_descriptor_3="/dev/fd/3"
+exec 3>&1 1>>${f_log} 2>&1
+
+if [ "X$config_update" = "XTrue" ]; then
+  {
+    check_kernel_version
+    set_locale
+    install_basic_package
+    identify_bytes_to_skip
+    extract_archive
+    move_file_to_integration
+    check_if_upgrade
+    pre_validate_script
+    write_tmp_config_file
+    can_connect_sme
+    write_config_file
+    change_file_ownership
+    post_config_update
+    restart_service skip_postgres_restart
+  } | awk '{ print strftime("[%Y-%m-%d %H:%M:%S]"), $0; fflush(); }' | tee $f_file_descriptor_3
+  exit 0
+fi
+
+{
+  check_kernel_version
+  set_locale
+  install_basic_package
+  identify_bytes_to_skip
+  extract_archive
+  move_file_to_integration
+  check_if_upgrade
+  identify_existing_agent
+  pre_validate_script
+  disable_existing_postgres_repo
+  add_enable_repo
+  install_configure_postgres
+  install_upgrade_agent
+  create_csagent_symlink
+  remove_repo
+  write_config_file
+  change_file_ownership
+  databse_migrate
+  create_cache_table
+  restart_service
+  install_gcc
+  install_update_connectors
+  install_connector_dep
+  collect_logs
+  restart_service skip_postgres_restart
+} | awk '{ print strftime("[%Y-%m-%d %H:%M:%S]"), $0; fflush(); }' | tee $f_file_descriptor_3
+
+exit 0
+
+__PAYLOAD_STARTS_AFTER_THIS__
+ã      Ì]s€∏1œ˙®;WR©M …xF3uªÁ9'QÁ·Œì·@$$!¶H Ì®ô¸˜Ó¸I9ä}wÌ˜¡&¡›≈Óbø àŒY¨¸ãR&ºtıÏèÄ=Ä„£#¸øˇbt`˛ÍwÄÉÉ£—≥˝£„—˛Ò!†?€€?#{à4»§¢Çêg3)vx¨ÿ\P≈ìX6Ò‚9èø¸˝π∞µµEŒít%¯|°⁄BHmƒ=íÉΩΩód˛ëãD(3E.„¿Ã”("S¡$w,ƒ·ã∑ÔÆ/ﬂú_ì≥∑o.._ùøπæ<Ω"´∆'ÔﬁNﬁ]û_üæ˚ïº˚·›Ÿ9†æ:∑ÊfqH@æ_¶0+ôR…éèä∑O2âãg	ˇ#VIdÒîÚ[Z‚≠ a)£‚QÒ%+ûWtYéˇáß3±¡L$KÕ∆!\8ç$…ëŒø(&bùUüA"Ωî™EÅ«æp©‰`†ÌÒ/ˇ‚ÚÍ¸ΩˇÎÈÎ+2&7†5!Œní™›`ï§“rƒ]Î%H‚üÀ]™„÷ºy´e‰|~ªú¯ì”ÎüÅÂfÃ¢dÓ ß»ät4Âªáª)n#îx˜x∆ß£Ètg?ÌÌçFlg:zIw^˚££Ÿ˛À„£C`2"*%y˝ÔäGÚd†U
+Ÿå¯>èπÚ}W≤h∂mˆ—2r¸&âŸDc" öò*˙1ªGÌb†® ŸXñï∏|FÍ¨*&£⁄g Øøñ»X⁄§™÷j:Ê <˝íá>:êèn„ñOö€∏ŒyXôßA§çDl“öâ 	ø~+«fâ ∆”‚°≠⁄=ú$e±ãﬂ∂â#ú!°≤¢±—´Èº,aM¥B^î–∞Rmõ\¡;c˝Ì"ã"Û>ñºSôàsVïﬁ!ƒ*Uπ¬w4 ÍÆ†ƒ™±§+NMAÉ–]ÎﬂŒ–¢”°XG¨ó	¯Ï}"¬◊IòE¨à’\∂ Mæ,≈P«Ëç`µÜµr-µu'’H,—¸Æsy.É¯‡øDÔ˛˙ó‡÷⁄åíL•ôÇ.dL„I%xÍ⁄ ˇ8Q9âßsw>M°◊IìΩñïr…*m*ÏbN2£∞∂°Òòs!qB~í⁄—JTq»O˘‰∂\Ì∞™ô»‹D,∂≈¸¯@TZ÷-]»§
+_,?◊2Öv®ÔDåªq2®WoËí9ãŒ~ŒîÎhÁÚùNπZ~ˆπÊ\è4W°‚Q˜Ïáñî√6◊ÉµúÇzâVa∑9Aù€à‚uPcAæÆÔù¨¨•Í‡{Ñ⁄Ãz&rC±Cæòo¶‡m7fÌXK˛çÿiƒ6˝*£—œõ*u∑F+¨≈æZ•õ9&b_#Ú∞ûxæGDà3XÿjyÖÜÀ4*n+|√pÿU\oÉ˙Ø⁄Ñˇè+¸[˝Æ˙Z¸V˜ñ≠~T[ã{≥¢j@€LÄÜkﬁo‘:çTS|¶˛/≥%s›jmìÁTÃ%¸{~{èOvR≠3Ï‚Ï¬›,Ru=+ﬂí1¥eEÔŸ—|‘öÌqWüÌnRul.∫ãüDî«u>Ìz∞›ëﬂÌŸ ú[ˆñFøÆ\ú/öX˘!ãË
+(ˆ˜öûí€”ßJ±e™PÿQ∑ÛúﬁŸ≠)ˆÑºëÜg4ãÙN?∂˝\SRtÃq]èVÊ[§ç•mÖı§êI∑çÊK∞ Îª”mwJ˘HËò™≈∂NOÄ63X?—MVÈ|Ôﬂ_Ω5#kñ¬lõ‰Ä%"ü¥ Y«z§T &ƒI9€YÈXìÚ[ÈÓ¶>⁄÷v’|2´x>û[÷èÊQÜ∏|z4ØZÿèkœO±V3Så;∆ÕøÊ±„⁄Ûp∞A™Ì›Øwø'∫ﬂpMY,ÍüQ‹Úx^9ñ[y]Eº¡Ü=<VÓ÷áòNa„Ø‹IÛŸäô∞Çx™Ù∏Z0≤§&ÿÍ:‘»≈®ÌJ,∏ıÂí=∞)moXö÷Œ¡ö[kˇ_}ÎÏÚo–N&íπ√X·Zdl´˝5◊ø˛êi°e*ÚtKŸ6†9‘≥{‘¸†jtﬁü.ôît^?2Lõ=tégJ$ñ¯ÿtÂ≠YµBÂúf·}≥∆˘î!UÙ°ı2»>◊∑Ú<äÊ‹À∞—lÄ!4û3-%ûºÜ≈àg§êäñ4ˆÚ˜j>ªßL2¡Ä¶B¯ J≤b˛,ù2O∞e<ÿÁåIı ”Gª"E=‰é∆¯µÎN|-ø”¢Åybôéªtm3ÿê'I
+˝$g“yÄ=ÒWG∑V–˝È›«	qhöF<–'Åªxw‡|[√¢Ã>TÚ`Rªœü7¶vâÎMëÃO≥iƒÂ¬-Vyl9¿&≥∂‹„⁄Û&§”$\ç—©7AÆîWè–5W@˛ƒ®Õ¬"åâÃÇ gY≠∂∫-÷LWÁsGüVí˚4˜$∑8TB;≠ÑÀ=≥9≠|l∆aÉ5BΩ<ZËt”ç≤n3’`m…§Ø;È¥Ûúπ‰Ÿ(ÀhT+…<1G°∑ %ÜfÀ¥±_˘⁄R|)∂N –B=¸„⁄’9πÓ@eeqc©7Ñ÷aãNèøµ…ôd"`†ÈIi›¨r$8Æ¢F-mŸÅKıbÎÑÇwÚÑªìß⁄‹:’∑ »z]Ï§KOÂ2x	ôDaUô*…|¯V]ˆÄãk’Ã®&iﬁ¡ód˙	5øŸÙ~„)û/πkôBïp<Å rÓ·OIx9Ò_ù_\ù^üø™ï◊$Q√‘çß˚kƒñ˚UƒA∞‚µ.Ë≈Ö‹&»\‚EV"Ω{›ÆcbárAJ$‘⁄Q9C©Ú+YÔS¬c◊LãËÌ∆« ª\1wZ|ì+wÚ±∂8AEÎ~îÃÂˇeÉ`f«v|„∏ÆªwT‡M∞πM≥UııRn5»>∏Ò–∫rj≤È∫¡©≥.ÿÊÁØ%SõÆ’yïQSFqÌΩ]™€Í¥æW=ä
+R¢%ÅﬁÑy9Q†‚‚ñ ¶÷€òé∞ùÍ™0™À¢vl.dÀã˚*‹∂ƒ¥QßËf~ﬁƒ •˘9Ñ7=>b1Ê;∑‡™/¢›Ü$Â«Æ≠@ûÎ´üQte|ÑØOIÚƒ1*Ëì∑[üéTΩaÆ˛°d]œ÷yÓ@∏í¥Û¥Üo∂•÷&Ï:∏6v€w¨Ω∞µû¶uÜRl∆¿≥Ê¸Ú(˙óéﬁ0Å¨à±hÇc0‡¯”
+l}“‰·±Ô;Üi—mçı’9Ûªõ}s≈öáué–‹TmM"é]t«´íx˝Y÷ºÚs∆UÓI’t⁄}∏W≤„≥ü·OC %ˇëHN
+ÚXπ…ﬁ÷I¡¬kl≠yX‘dXÀ“ù‹¨,˛^∏Ø_@"T_oÙÎµn~Ïó<jôv¸ögËu$r’}ßTd]{YÍÙø˛±Y=Ù–C=Ù–C=Ù–C=Ù–C=Ù–C=Ù–C=Ù–C=Ù–C=Ù–C=Ùª¿Õ›EÓ P  
